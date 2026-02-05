@@ -273,3 +273,89 @@ def triton_batch_blockwise_quant(xs,
     )
 
     return x_q, x_scale, xt_q, xt_scale
+
+
+@triton.jit
+def block_quant_fp4_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    
+    # Offsets for the block
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # We load pairs: columns 2*k and 2*k+1
+    # n_packed range: 0 to 63
+    n_packed = pid_n * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
+    
+    offs_n_even = n_packed * 2
+    offs_n_odd  = n_packed * 2 + 1
+    
+    offs_even = offs_m[:, None] * N + offs_n_even[None, :]
+    offs_odd  = offs_m[:, None] * N + offs_n_odd[None, :]
+    
+    mask_even = (offs_m[:, None] < M) & (offs_n_even[None, :] < N)
+    mask_odd  = (offs_m[:, None] < M) & (offs_n_odd[None, :] < N)
+    
+    # Load input pairs
+    x_even = tl.load(x_ptr + offs_even, mask=mask_even, other=0.0).to(tl.float32)
+    x_odd  = tl.load(x_ptr + offs_odd,  mask=mask_odd,  other=0.0).to(tl.float32)
+    
+    # Compute abs max for scale (across both even and odd elements)
+    max_even = tl.max(tl.abs(x_even))
+    max_odd  = tl.max(tl.abs(x_odd))
+    max_val  = tl.maximum(max_even, max_odd)
+    
+    # E2M1 max representable is 6.0.
+    s = tl.maximum(max_val / 6.0, 1e-30)
+    
+    # Quantize: x / s
+    y_even_f = x_even / s
+    y_odd_f  = x_odd  / s
+    
+    # Quantize to 4-bit integer code (-7 to 7)
+    y_even_i = y_even_f.to(tl.int8)
+    y_odd_i  = y_odd_f.to(tl.int8)
+    
+    y_even_i = tl.minimum(tl.maximum(y_even_i, -7), 7)
+    y_odd_i  = tl.minimum(tl.maximum(y_odd_i, -7), 7)
+    
+    y_even_i = y_even_i & 0x0F
+    y_odd_i  = y_odd_i  & 0x0F
+    
+    # Pack: even in lower bits, odd in upper bits
+    y_packed = y_even_i | (y_odd_i << 4)
+    
+    # Store packed output (N/2 width)
+    offs_packed = offs_m[:, None] * (N // 2) + n_packed[None, :]
+    mask_packed = (offs_m[:, None] < M) & (n_packed[None, :] < (N // 2))
+    
+    tl.store(y_ptr + offs_packed, y_packed, mask=mask_packed)
+    tl.store(s_ptr + pid_m * n + pid_n, s)
+
+
+def triton_block_quant_fp4(x, block_size=128):
+    """
+    Blockwise quantization to packed FP4 (stored as uint8, 2 elements per byte).
+    
+    Args:
+        x: Input tensor (M, N)
+        block_size: Block size for quantization.
+        
+    Returns:
+        y: Packed quantized tensor (M, N // 2) dtype=torch.uint8
+        s: Scales (M // block_size, N // block_size) dtype=torch.float32
+    """
+    assert x.is_contiguous()
+    M, N = x.size()
+    assert N % 2 == 0, "N must be divisible by 2 for packed FP4"
+    
+    y = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    s = torch.empty(triton.cdiv(M, block_size), triton.cdiv(N, block_size), dtype=torch.float32, device=x.device)
+    
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    
+    block_quant_fp4_kernel[grid](
+        x, y, s, M, N, BLOCK_SIZE=block_size, num_stages=4, num_warps=8
+    )
+    return y, s
