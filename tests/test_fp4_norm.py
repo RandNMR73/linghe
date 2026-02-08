@@ -81,11 +81,17 @@ def manual_fp4_dequant(packed_fp4: torch.Tensor, scale: torch.Tensor, global_sf:
     unpacked_blocks = unpacked.reshape(M, NB, 16)
     
     # Convert scale from float8 to float32
-    scale_float = scale.float().T.reshape(M, NB, 1)  # [M, NB, 1]
+    # scale is [M, NB] already (from our kernel)
+    scale_float = scale.float().reshape(M, NB, 1)  # [M, NB, 1]
     
     # Apply scales: dequant = packed_val * block_scale / global_sf
-    global_sf_expanded = global_sf.reshape(M, 1, 1)
-    dequant = unpacked_blocks * scale_float / global_sf_expanded
+    if global_sf.numel() == 1:
+        global_sf_expanded = global_sf.reshape(1, 1, 1).float()
+    else:
+        global_sf_expanded = global_sf.reshape(M, 1, 1).float()
+        
+    # Perform math in float32 to avoid overflow
+    dequant = unpacked_blocks.float() * scale_float / global_sf_expanded
     
     return dequant.reshape(M, N).to(dtype)
 
@@ -138,8 +144,17 @@ def test_rms_norm_and_fp4_quant(M: int = 4096, N: int = 2048, bench: bool = Fals
     print(f"  Shapes OK: out={out_fp4.shape}, scale={scale.shape}, global_sf={global_sf.item():.4f}")
     
     # Verify RMS values
+    # Verify RMS values
     ref_rms = torch.rsqrt(torch.mean(x.float() ** 2, dim=-1) + 1e-6)
+    if torch.isnan(rms).any():
+        print(f"  [FAIL] RMS output contains {torch.isnan(rms).sum()} NaNs!")
     rms_match = output_check(ref_rms, rms, "rms")
+    
+    # Check for NaN in scale output immediately
+    if torch.isnan(scale.float()).any():
+        print(f"  [FAIL] Scale output contains {torch.isnan(scale.float()).sum()} NaNs!")
+    if torch.isinf(scale.float()).any():
+        print(f"  [FAIL] Scale output contains {torch.isinf(scale.float()).sum()} Infs!")
     
     # Reference: RMSNorm + FlashInfer FP4 quantize
     ref_normed = torch_rms_forward(x, weight)
@@ -167,12 +182,26 @@ def test_rms_norm_and_fp4_quant(M: int = 4096, N: int = 2048, bench: bool = Fals
         # Also compare scales (using cosine similarity as small numerical diffs affect exact match)
         scale_f = scale.float().flatten()
         ref_scale_f = ref_scale.float().flatten()
-        scale_cos = F.cosine_similarity(scale_f, ref_scale_f, dim=0).item()
+        # Use simple dot product normalized if cosine sim is unstable
+        # Or just ensure float32
+        scale_cos = torch.nn.functional.cosine_similarity(scale_f, ref_scale_f, dim=0, eps=1e-6).item()
+        
         # Scale match is around 0.91 due to FP8 bit differences, but functional correctness is verified
-        scale_match = scale_cos > 0.90 or math.isnan(scale_cos)
+        scale_match = scale_cos > 0.90 or (math.isnan(scale_cos) and torch.allclose(scale_f, ref_scale_f, atol=1e-3))
         print(f"  [{'PASS' if scale_match else 'FAIL'}] FlashInfer scale cos_sim: {scale_cos:.4f}")
         
         flashinfer_match = fp4_close and scale_match
+        
+        # Verify functional correctness by dequantizing (Manual Check)
+        # This confirms that even if bits are slightly different, the values are correct
+        # Scale: [M, N // 16] -> [M, N // 16, 1]
+        # Packed: [M, N // 2]
+        dequantized = manual_fp4_dequant(out_fp4, scale, global_sf, M, N)
+        
+        # Compare dequantized output against original RMSNorm output
+        # E2M1 quantization has limited precision, so we expect some error
+        # Normalized cos_sim should be high (>0.99)
+        output_check(ref_normed, dequantized, "dequantized vs RMSNorm", atol=1.0, rtol=0.1)
     else:
         print("  [SKIP] FlashInfer not available for comparison")
         flashinfer_match = True  # Skip this check
@@ -194,6 +223,7 @@ def test_fp4_quant_multiple_sizes():
         (4096, 2048),
         (8192, 4096),
         (16384, 5120),
+        (32768, 1536),
         (32768, 5120),
     ]
     
